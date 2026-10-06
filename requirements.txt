@@ -1,0 +1,4 @@
+oracledb>=2.0,<4
+playwright>=1.48,<2
+pywin32>=306
+cryptography>=42

@@ -1,0 +1,30 @@
+{
+  "notify": {
+    "smtp_host": "mmsvmf00.mitsui-mining.local",
+    "smtp_port": 25,
+    "smtp_auth_enabled": false,
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_use_tls": false,
+    "smtp_use_ssl": false,
+    "from_addr": "scan-kakoki-1@n-coke.com",
+    "subject_prefix": "【RTCM更新結果通知】",
+    "recipients": [
+      {
+        "name": "遠藤 優介",
+        "email": "yusuke-endo@n-coke.com",
+        "enabled": true
+      },
+      {
+        "name": "高橋　宏",
+        "email": "hiroshi-takahashi@n-coke.com",
+        "enabled": true
+      },
+      {
+        "name": "追加通知先2",
+        "email": "example2@example.com",
+        "enabled": false
+      }
+    ]
+  }
+}

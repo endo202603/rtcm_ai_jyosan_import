@@ -1,0 +1,11 @@
+config.env
+notify.json
+browser-profile/
+__pycache__/
+*.pyc
+*.sqlite3
+build/
+dist/
+work/
+queue/
+logs/
