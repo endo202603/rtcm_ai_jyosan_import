@@ -54,16 +54,18 @@ JSON_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "seiban": {"type": "string", "minLength": 1, "maxLength": 25},
+        "pdf_hansu": {"type": "integer", "minimum": 0, "maximum": 999},
         "otkmkmnoki": {"type": "string", "pattern": "^[0-9]{8}$"},
         "otkmkmcost": {"type": "integer", "minimum": 0, "maximum": MAX_COST},
     },
-    "required": ["seiban", "otkmkmnoki", "otkmkmcost"],
+    "required": ["seiban", "pdf_hansu", "otkmkmnoki", "otkmkmcost"],
 }
 
 
 @dataclass(frozen=True)
 class ExtractedData:
     seiban: str
+    pdf_hansu: int
     otkmkmnoki: str
     otkmkmcost: int
 
@@ -85,12 +87,19 @@ def required_env(name: str) -> str:
 
 
 def validate_extracted(value: dict[str, Any]) -> ExtractedData:
-    if set(value) != {"seiban", "otkmkmnoki", "otkmkmcost"}:
-        raise ValueError("生成AIのJSONには seiban, otkmkmnoki, otkmkmcost の3項目だけを指定してください")
+    if set(value) != {"seiban", "pdf_hansu", "otkmkmnoki", "otkmkmcost"}:
+        raise ValueError(
+            "生成AIのJSONには seiban, pdf_hansu, otkmkmnoki, "
+            "otkmkmcost の4項目だけを指定してください"
+        )
 
     seiban = str(value["seiban"]).strip().upper()
     if not seiban or len(seiban) > 25 or not re.fullmatch(r"[A-Z0-9_-]+", seiban):
         raise ValueError(f"製番の形式が不正です: {seiban!r}")
+
+    pdf_hansu = value["pdf_hansu"]
+    if isinstance(pdf_hansu, bool) or not isinstance(pdf_hansu, int) or not (0 <= pdf_hansu <= 999):
+        raise ValueError(f"PDF版数は0～999の整数で指定してください: {pdf_hansu!r}")
 
     noki = str(value["otkmkmnoki"]).strip()
     if not re.fullmatch(r"\d{8}", noki):
@@ -103,7 +112,12 @@ def validate_extracted(value: dict[str, Any]) -> ExtractedData:
     cost = value["otkmkmcost"]
     if isinstance(cost, bool) or not isinstance(cost, int) or not (0 <= cost <= MAX_COST):
         raise ValueError(f"落付見込原価は0以上15桁以内の整数で指定してください: {cost!r}")
-    return ExtractedData(seiban=seiban, otkmkmnoki=noki, otkmkmcost=cost)
+    return ExtractedData(
+        seiban=seiban,
+        pdf_hansu=pdf_hansu,
+        otkmkmnoki=noki,
+        otkmkmcost=cost,
+    )
 
 
 def strip_json_fence(text: str) -> str:
@@ -282,9 +296,22 @@ def fetch_one_dict(cursor: Any) -> dict[str, Any] | None:
 
 
 def insert_into_oracle(extracted: ExtractedData, config: RtcmConfig, dry_run: bool) -> dict[str, Any]:
+    if extracted.pdf_hansu != 0:
+        return {
+            "seiban": extracted.seiban,
+            "pdf_hansu": extracted.pdf_hansu,
+            "skipped": True,
+            "skip_reason": (
+                f"PDFの版数が{extracted.pdf_hansu}版のため、"
+                "初版（0版）以外はRTCM登録対象外です。"
+            ),
+            "committed": False,
+        }
+
     if extracted.seiban.upper().startswith("U"):
         return {
             "seiban": extracted.seiban,
+            "pdf_hansu": extracted.pdf_hansu,
             "skipped": True,
             "skip_reason": "U製番のためRTCM登録対象外です。",
             "committed": False,
@@ -376,6 +403,7 @@ def insert_into_oracle(extracted: ExtractedData, config: RtcmConfig, dry_run: bo
             "kyotencd": config.kyotencd,
             "kojcd": config.kojcd,
             "seiban": extracted.seiban,
+            "pdf_hansu": extracted.pdf_hansu,
             "hansu": row["HANSU"],
             "recno": recno,
             "otkmkmnoki": extracted.otkmkmnoki,

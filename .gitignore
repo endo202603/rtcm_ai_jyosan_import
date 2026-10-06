@@ -1,5 +1,7 @@
 config.env
 notify.json
+*config.env
+*notify.json
 browser-profile/
 __pycache__/
 *.pyc

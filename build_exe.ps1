@@ -36,6 +36,7 @@ try {
     Remove-Item -Force -LiteralPath $BuiltExe
     Copy-Item -Force -LiteralPath (Join-Path $ProjectDir "config.env") -Destination $OutputDir
     Copy-Item -Force -LiteralPath (Join-Path $ProjectDir "notify.json") -Destination $OutputDir
+    Copy-Item -Force -LiteralPath (Join-Path $ProjectDir "prompt.txt") -Destination $OutputDir
     Copy-Item -Force -LiteralPath (Join-Path $ProjectDir "README.md") -Destination $OutputDir
     Write-Host "Build complete: $OutputDir"
 }

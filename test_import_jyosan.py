@@ -33,25 +33,43 @@ from watch_folder import (
 class ImportJyosanTest(unittest.TestCase):
     def setUp(self):
         self.config = RtcmConfig("MMC", "MMC", "MMC", "80209", "AIJYSN01")
-        self.extracted = ExtractedData("V3579", "20261023", 3_216_000)
+        self.extracted = ExtractedData("V3579", 0, "20261023", 3_216_000)
         self.now = datetime(2026, 9, 2, 10, 35, 25, tzinfo=JST)
 
     def test_validation(self):
         actual = validate_extracted(
-            {"seiban": " v3579 ", "otkmkmnoki": "20261023", "otkmkmcost": 3_216_000}
+            {
+                "seiban": " v3579 ",
+                "pdf_hansu": 0,
+                "otkmkmnoki": "20261023",
+                "otkmkmcost": 3_216_000,
+            }
         )
         self.assertEqual(actual, self.extracted)
 
+    def test_pdf_hansu_must_be_non_negative_integer(self):
+        with self.assertRaises(ValueError):
+            validate_extracted(
+                {
+                    "seiban": "V3579",
+                    "pdf_hansu": -1,
+                    "otkmkmnoki": "20261023",
+                    "otkmkmcost": 3_216_000,
+                }
+            )
+
     def test_browser_result_with_code_fence(self):
         actual = parse_json_from_result(
-            '```json\n{"seiban":"V3579","otkmkmnoki":"20261023","otkmkmcost":3216000}\n```'
+            '```json\n{"seiban":"V3579","pdf_hansu":0,'
+            '"otkmkmnoki":"20261023","otkmkmcost":3216000}\n```'
         )
         self.assertEqual(actual, self.extracted)
 
     def test_browser_result_after_explanation(self):
         actual = parse_json_from_result(
             'PDFから以下を読み取りました。\n\n'
-            '{"seiban":"V3579","otkmkmnoki":"20261023","otkmkmcost":3216000}'
+            '{"seiban":"V3579","pdf_hansu":0,'
+            '"otkmkmnoki":"20261023","otkmkmcost":3216000}'
         )
         self.assertEqual(actual, self.extracted)
 
@@ -59,7 +77,7 @@ class ImportJyosanTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_json_from_result(
                 'PDFから以下を読み取りました。\n\n'
-                '{"seiban":"V3579","otkmkmnoki":"202610'
+                '{"seiban":"V3579","pdf_hansu":0,"otkmkmnoki":"202610'
             )
 
     def test_pdf_upload_name_removes_spaces(self):
@@ -214,15 +232,38 @@ class ImportJyosanTest(unittest.TestCase):
         self.assertLess(body.index(guidance), body.index(retry_guidance))
 
     def test_u_seiban_is_skipped_without_database_access(self):
-        extracted = ExtractedData("U9007885", "20261030", 988_000)
+        extracted = ExtractedData("U9007885", 0, "20261030", 988_000)
         result = insert_into_oracle(extracted, self.config, dry_run=False)
         self.assertTrue(result["skipped"])
         self.assertFalse(result["committed"])
         self.assertIn("U製番", result["skip_reason"])
 
+    def test_revised_pdf_is_skipped_without_database_access(self):
+        extracted = ExtractedData("V3579", 1, "20261023", 3_216_000)
+        result = insert_into_oracle(extracted, self.config, dry_run=False)
+        self.assertTrue(result["skipped"])
+        self.assertFalse(result["committed"])
+        self.assertEqual(result["pdf_hansu"], 1)
+        self.assertIn("初版（0版）以外", result["skip_reason"])
+
+    def test_revised_pdf_notification_reports_skip(self):
+        result = {
+            "extracted": {"seiban": "V3579", "pdf_hansu": 2},
+            "database": {
+                "skipped": True,
+                "pdf_hansu": 2,
+                "skip_reason": "PDFの版数が2版のため、初版（0版）以外はRTCM登録対象外です。",
+            },
+            "pdf": r"C:\RTCM_AI\work\V3579.pdf",
+        }
+        subject, body = build_notification("skipped", Path("V3579.pdf"), result)
+        self.assertIn("スキップ", subject)
+        self.assertIn("PDF版数: 2", body)
+        self.assertIn("初版（0版）以外", body)
+
     def test_u_seiban_notification_reports_skip(self):
         result = {
-            "extracted": {"seiban": "U9007885"},
+            "extracted": {"seiban": "U9007885", "pdf_hansu": 0},
             "database": {
                 "skipped": True,
                 "skip_reason": "U製番のためRTCM登録対象外です。",

@@ -66,9 +66,10 @@ def build_notification(status: str, source: Path, result: dict[str, Any] | None,
         lines.extend(
             [
                 f"製番: {extracted.get('seiban', '')}",
+                f"PDF版数: {extracted.get('pdf_hansu', '')}",
                 f"落付見込納期: {extracted.get('otkmkmnoki', '')}",
                 f"落付見込原価: {extracted.get('otkmkmcost', '')}",
-                f"版数: {database.get('hansu', '')}",
+                f"RTCM登録版数: {database.get('hansu', '')}",
                 f"RECNO: {database.get('recno', '')}",
                 f"落付見込販価: {database.get('otkmkmhnkg', '')}",
                 f"落付見込益金: {database.get('otkmkmeki', '')}",
@@ -84,6 +85,7 @@ def build_notification(status: str, source: Path, result: dict[str, Any] | None,
         lines.extend(
             [
                 f"製番: {extracted.get('seiban', '')}",
+                f"PDF版数: {extracted.get('pdf_hansu', '')}",
                 f"スキップ理由: {database.get('skip_reason', 'RTCM登録対象外です。')}",
                 "RTCMへの登録は行っていません。",
                 f"PDF保管先: {result.get('archived_pdf', result.get('pdf', ''))}",
