@@ -2,5 +2,11 @@
   "seiban": "V3579",
   "pdf_hansu": 0,
   "otkmkmnoki": "20261023",
-  "otkmkmcost": 3216000
+  "otkmkmcost": 3216000,
+  "demand_customer_code": "109155004",
+  "demand_customer_name": "太陽誘電",
+  "demand_customer_name_kana": "ﾀｲﾖｳﾕｳﾃﾞﾝ",
+  "demand_customer_postal_code": "3701196",
+  "demand_customer_address": "佐波郡玉村町川井1796-1",
+  "demand_customer_phone": "0270-65-7121"
 }

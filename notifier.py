@@ -63,6 +63,7 @@ def build_notification(status: str, source: Path, result: dict[str, Any] | None,
     if success and result:
         extracted = result.get("extracted", {})
         database = result.get("database", {})
+        c1_warehouse = result.get("c1_warehouse", {})
         lines.extend(
             [
                 f"製番: {extracted.get('seiban', '')}",
@@ -74,6 +75,10 @@ def build_notification(status: str, source: Path, result: dict[str, Any] | None,
                 f"落付見込販価: {database.get('otkmkmhnkg', '')}",
                 f"落付見込益金: {database.get('otkmkmeki', '')}",
                 f"落付見込益率: {database.get('otkmkmekirt', '')}",
+                f"需要家コード: {extracted.get('demand_customer_code', '')}",
+                f"需要家名称: {extracted.get('demand_customer_name', '')}",
+                f"C1倉庫登録結果: {c1_warehouse.get('status', '')}",
+                f"C1倉庫コード: {c1_warehouse.get('warehouse_code', '')}",
                 f"PDF保管先: {result.get('archived_pdf', result.get('pdf', ''))}",
             ]
         )

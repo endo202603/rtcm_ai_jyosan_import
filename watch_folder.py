@@ -13,6 +13,7 @@ import traceback
 from datetime import datetime, time as datetime_time, timedelta
 from pathlib import Path
 
+from c1_browser import C1WarehouseBrowser
 from genu_browser import GenuBrowser
 from import_jyosan import JST, RtcmConfig, application_dir, insert_into_oracle, required_env
 from notifier import build_notification, load_notify_config, send_notification
@@ -315,6 +316,8 @@ def process_file(
     dry_run: bool,
     watch_folder: Path,
     archive_pdf_enabled: bool,
+    c1_browser: C1WarehouseBrowser,
+    c1_enabled: bool,
 ) -> dict:
     job_folder = work_folder / digest[:16]
     job_folder.mkdir(parents=True, exist_ok=True)
@@ -337,12 +340,75 @@ def process_file(
     (job_folder / "extracted.json").write_text(
         json.dumps(extracted.__dict__, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    db_result = insert_into_oracle(extracted, config, dry_run)
+    # RTCMコミット後にC1で失敗した場合、再実行でT_JYOSANを重複登録しないよう
+    # RTCM成功結果を直ちにチェックポイントへ保存する。
+    rtcm_checkpoint = job_folder / "rtcm_result.json"
+    db_result = None
+    if not dry_run and rtcm_checkpoint.is_file():
+        checkpoint_value = json.loads(rtcm_checkpoint.read_text(encoding="utf-8"))
+        if (
+            checkpoint_value.get("committed") is True
+            and checkpoint_value.get("seiban") == extracted.seiban
+        ):
+            db_result = checkpoint_value
+            print(
+                f"RTCM登録済みチェックポイントを再利用します: {extracted.seiban}",
+                flush=True,
+            )
+    if db_result is None:
+        db_result = insert_into_oracle(extracted, config, dry_run)
+        if db_result.get("committed") is True:
+            checkpoint_temp = rtcm_checkpoint.with_suffix(".json.tmp")
+            checkpoint_temp.write_text(
+                json.dumps(db_result, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            checkpoint_temp.replace(rtcm_checkpoint)
+
+    if db_result.get("skipped"):
+        c1_result = {
+            "status": "not_run",
+            "registered": False,
+            "reason": "RTCM登録がスキップされたためC1倉庫登録も実行していません。",
+        }
+    elif dry_run:
+        c1_result = c1_browser.register(extracted, dry_run=True) if c1_enabled else {
+            "status": "disabled",
+            "registered": False,
+        }
+    elif db_result.get("committed") and c1_enabled:
+        print(f"処理中: RTCM登録成功後のC1倉庫登録: {extracted.seiban}", flush=True)
+        try:
+            c1_result = c1_browser.register(extracted)
+        except Exception as exc:
+            partial_result = {
+                "source": str(source),
+                "pdf": str(pdf_path),
+                "extracted": extracted.__dict__,
+                "database": db_result,
+                "c1_warehouse": {
+                    "status": "error",
+                    "registered": False,
+                    "error": str(exc),
+                },
+            }
+            (job_folder / "result.json").write_text(
+                json.dumps(partial_result, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            raise RuntimeError(
+                "RTCM登録は成功しましたが、C1倉庫登録に失敗しました。"
+                f"再実行時はRTCM登録済みチェックポイントを再利用します: {exc}"
+            ) from exc
+        print(f"C1倉庫登録完了: {json.dumps(c1_result, ensure_ascii=False)}", flush=True)
+    else:
+        c1_result = {"status": "disabled", "registered": False}
     result = {
         "source": str(source),
         "pdf": str(pdf_path),
         "extracted": extracted.__dict__,
         "database": db_result,
+        "c1_warehouse": c1_result,
     }
     result["archive_pdf_enabled"] = archive_pdf_enabled
     if not dry_run and archive_pdf_enabled:
@@ -376,6 +442,7 @@ def main() -> int:
     stable_seconds = int(os.getenv("RTCM_FILE_STABLE_SECONDS", "5"))
     batch_time = parse_batch_time(os.getenv("RTCM_BATCH_TIME", "08:15"))
     archive_pdf_enabled = env_bool("RTCM_ARCHIVE_PDF_ENABLED", True)
+    c1_enabled = env_bool("C1_WAREHOUSE_ENABLED", False)
     auto_retry_errors = env_bool("RTCM_AUTO_RETRY_ERRORS", False)
     error_retry_seconds = int(os.getenv("RTCM_ERROR_RETRY_SECONDS", "300"))
     if error_retry_seconds < 0:
@@ -389,6 +456,7 @@ def main() -> int:
     notify_config = load_notify_config(notify_path)
 
     browser = GenuBrowser()
+    c1_browser = C1WarehouseBrowser()
     try:
         while True:
             now = datetime.now(JST)
@@ -443,6 +511,8 @@ def main() -> int:
                         args.dry_run,
                         watch_folder,
                         archive_pdf_enabled,
+                        c1_browser,
+                        c1_enabled,
                     )
                     result["source"] = str(original_source)
                     result["queue_source"] = str(source)
@@ -484,6 +554,7 @@ def main() -> int:
                 return 0
             time.sleep(poll_seconds)
     finally:
+        c1_browser.close()
         browser.close()
 
 

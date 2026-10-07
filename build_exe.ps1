@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PythonExe = "C:\Users\yusuke-endo\AppData\Local\Python\pythoncore-3.14-64\python.exe"
+$BuildWorkDir = Join-Path $env:TEMP ("rtcm_ai_jyosan_import-build-" + [Guid]::NewGuid().ToString("N"))
 
 Push-Location $ProjectDir
 try {
@@ -12,7 +13,7 @@ try {
         --console `
         --name rtcm_ai_jyosan_import `
         --distpath dist `
-        --workpath build `
+        --workpath $BuildWorkDir `
         --specpath build `
         --collect-all playwright `
         --collect-all oracledb `
@@ -20,6 +21,10 @@ try {
         --hidden-import win32cred `
         --hidden-import pywintypes `
         watch_folder.py
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller failed with exit code $LASTEXITCODE"
+    }
 
     $OutputDir = Join-Path $ProjectDir "dist\rtcm_ai_jyosan_import"
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
@@ -42,4 +47,7 @@ try {
 }
 finally {
     Pop-Location
+    if (Test-Path -LiteralPath $BuildWorkDir) {
+        Remove-Item -Recurse -Force -LiteralPath $BuildWorkDir -ErrorAction SilentlyContinue
+    }
 }
