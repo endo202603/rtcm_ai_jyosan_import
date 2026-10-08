@@ -5,6 +5,7 @@ from datetime import datetime, time as datetime_time
 from decimal import Decimal
 from pathlib import Path
 
+from c1_browser import C1WarehouseBrowser
 from genu_browser import parse_json_from_result
 from notifier import build_notification, load_notify_config
 from import_jyosan import (
@@ -34,7 +35,17 @@ from watch_folder import (
 class ImportJyosanTest(unittest.TestCase):
     def setUp(self):
         self.config = RtcmConfig("MMC", "MMC", "MMC", "80209", "AIJYSN01")
-        self.extracted = ExtractedData("V3579", 0, "20261023", 3_216_000)
+        self.customer = {
+            "demand_customer_code": "109155004",
+            "demand_customer_name": "太陽誘電",
+            "demand_customer_name_kana": "ﾀｲﾖｳﾕｳﾃﾞﾝ",
+            "demand_customer_postal_code": "3701196",
+            "demand_customer_address": "佐波郡玉村町川井1796-1",
+            "demand_customer_phone": "0270-65-7121",
+        }
+        self.extracted = ExtractedData(
+            "V3579", 0, "20261023", 3_216_000, *self.customer.values()
+        )
         self.now = datetime(2026, 9, 2, 10, 35, 25, tzinfo=JST)
 
     def test_validation(self):
@@ -44,6 +55,7 @@ class ImportJyosanTest(unittest.TestCase):
                 "pdf_hansu": 0,
                 "otkmkmnoki": "20261023",
                 "otkmkmcost": 3_216_000,
+                **self.customer,
             }
         )
         self.assertEqual(actual, self.extracted)
@@ -56,13 +68,19 @@ class ImportJyosanTest(unittest.TestCase):
                     "pdf_hansu": -1,
                     "otkmkmnoki": "20261023",
                     "otkmkmcost": 3_216_000,
+                    **self.customer,
                 }
             )
 
     def test_browser_result_with_code_fence(self):
         actual = parse_json_from_result(
             '```json\n{"seiban":"V3579","pdf_hansu":0,'
-            '"otkmkmnoki":"20261023","otkmkmcost":3216000}\n```'
+            '"otkmkmnoki":"20261023","otkmkmcost":3216000,'
+            '"demand_customer_code":"109155004","demand_customer_name":"太陽誘電",'
+            '"demand_customer_name_kana":"ﾀｲﾖｳﾕｳﾃﾞﾝ",'
+            '"demand_customer_postal_code":"3701196",'
+            '"demand_customer_address":"佐波郡玉村町川井1796-1",'
+            '"demand_customer_phone":"0270-65-7121"}\n```'
         )
         self.assertEqual(actual, self.extracted)
 
@@ -70,7 +88,12 @@ class ImportJyosanTest(unittest.TestCase):
         actual = parse_json_from_result(
             'PDFから以下を読み取りました。\n\n'
             '{"seiban":"V3579","pdf_hansu":0,'
-            '"otkmkmnoki":"20261023","otkmkmcost":3216000}'
+            '"otkmkmnoki":"20261023","otkmkmcost":3216000,'
+            '"demand_customer_code":"109155004","demand_customer_name":"太陽誘電",'
+            '"demand_customer_name_kana":"ﾀｲﾖｳﾕｳﾃﾞﾝ",'
+            '"demand_customer_postal_code":"3701196",'
+            '"demand_customer_address":"佐波郡玉村町川井1796-1",'
+            '"demand_customer_phone":"0270-65-7121"}'
         )
         self.assertEqual(actual, self.extracted)
 
@@ -236,14 +259,18 @@ class ImportJyosanTest(unittest.TestCase):
         self.assertLess(body.index(guidance), body.index(retry_guidance))
 
     def test_u_seiban_is_skipped_without_database_access(self):
-        extracted = ExtractedData("U9007885", 0, "20261030", 988_000)
+        extracted = ExtractedData(
+            "U9007885", 0, "20261030", 988_000, *self.customer.values()
+        )
         result = insert_into_oracle(extracted, self.config, dry_run=False)
         self.assertTrue(result["skipped"])
         self.assertFalse(result["committed"])
         self.assertIn("U製番", result["skip_reason"])
 
     def test_revised_pdf_is_skipped_without_database_access(self):
-        extracted = ExtractedData("V3579", 1, "20261023", 3_216_000)
+        extracted = ExtractedData(
+            "V3579", 1, "20261023", 3_216_000, *self.customer.values()
+        )
         result = insert_into_oracle(extracted, self.config, dry_run=False)
         self.assertTrue(result["skipped"])
         self.assertFalse(result["committed"])
@@ -361,6 +388,25 @@ class ImportJyosanTest(unittest.TestCase):
         self.assertNotIn("JKYSNCOST", row)
         self.assertEqual(row["JKYSNEKIRT"], Decimal("100.00"))
 
+    def test_c1_dry_run_builds_registered_record_shape_without_browser(self):
+        result = C1WarehouseBrowser().register(self.extracted, dry_run=True)
+        self.assertEqual(result["status"], "dry_run")
+        self.assertFalse(result["registered"])
+        self.assertEqual(result["warehouse_code"], "EG746")
+        self.assertEqual(result["display_name"], "V3579 太陽誘電")
+        self.assertEqual(result["name_kana"], "V3579 ﾀｲﾖｳﾕｳﾃﾞﾝ")
+
+    def test_customer_address_length_is_checked_for_c1_field(self):
+        with self.assertRaises(ValueError):
+            validate_extracted(
+                {
+                    "seiban": "V3579",
+                    "pdf_hansu": 0,
+                    "otkmkmnoki": "20261023",
+                    "otkmkmcost": 3_216_000,
+                    **{**self.customer, "demand_customer_address": "あ" * 33},
+                }
+            )
     def test_otmkmsdbmn_is_derived_from_seiban_prefix(self):
         for seiban in ("A0907", "G1234", "H1234", "K1234", "L1801", "M0123"):
             with self.subTest(seiban=seiban):

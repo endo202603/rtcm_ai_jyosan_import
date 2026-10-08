@@ -232,7 +232,7 @@ class GenuBrowser:
                 last_result = current
                 try:
                     # 回答はストリーミング表示されるため、説明文や途中までのJSONを
-                    # 最終結果とみなさず、3項目が揃った妥当なJSONになるまで待つ。
+                    # 最終結果とみなさず、全項目が揃った妥当なJSONになるまで待つ。
                     return parse_json_from_result(current)
                 except (ValueError, TypeError):
                     pass

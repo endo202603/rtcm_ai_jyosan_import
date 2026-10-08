@@ -57,8 +57,25 @@ JSON_SCHEMA = {
         "pdf_hansu": {"type": "integer", "minimum": 0, "maximum": 999},
         "otkmkmnoki": {"type": "string", "pattern": "^[0-9]{8}$"},
         "otkmkmcost": {"type": "integer", "minimum": 0, "maximum": MAX_COST},
+        "demand_customer_code": {"type": "string", "pattern": "^[0-9]{9}$"},
+        "demand_customer_name": {"type": "string", "minLength": 1, "maxLength": 40},
+        "demand_customer_name_kana": {"type": "string", "minLength": 1, "maxLength": 40},
+        "demand_customer_postal_code": {"type": "string", "pattern": "^[0-9]{7}$"},
+        "demand_customer_address": {"type": "string", "minLength": 1, "maxLength": 32},
+        "demand_customer_phone": {"type": "string", "minLength": 1, "maxLength": 16},
     },
-    "required": ["seiban", "pdf_hansu", "otkmkmnoki", "otkmkmcost"],
+    "required": [
+        "seiban",
+        "pdf_hansu",
+        "otkmkmnoki",
+        "otkmkmcost",
+        "demand_customer_code",
+        "demand_customer_name",
+        "demand_customer_name_kana",
+        "demand_customer_postal_code",
+        "demand_customer_address",
+        "demand_customer_phone",
+    ],
 }
 
 
@@ -68,6 +85,12 @@ class ExtractedData:
     pdf_hansu: int
     otkmkmnoki: str
     otkmkmcost: int
+    demand_customer_code: str
+    demand_customer_name: str
+    demand_customer_name_kana: str
+    demand_customer_postal_code: str
+    demand_customer_address: str
+    demand_customer_phone: str
 
 
 @dataclass(frozen=True)
@@ -87,10 +110,21 @@ def required_env(name: str) -> str:
 
 
 def validate_extracted(value: dict[str, Any]) -> ExtractedData:
-    if set(value) != {"seiban", "pdf_hansu", "otkmkmnoki", "otkmkmcost"}:
+    expected_keys = {
+        "seiban",
+        "pdf_hansu",
+        "otkmkmnoki",
+        "otkmkmcost",
+        "demand_customer_code",
+        "demand_customer_name",
+        "demand_customer_name_kana",
+        "demand_customer_postal_code",
+        "demand_customer_address",
+        "demand_customer_phone",
+    }
+    if set(value) != expected_keys:
         raise ValueError(
-            "生成AIのJSONには seiban, pdf_hansu, otkmkmnoki, "
-            "otkmkmcost の4項目だけを指定してください"
+            "生成AIのJSON項目が不正です。必要項目: " + ", ".join(sorted(expected_keys))
         )
 
     seiban = str(value["seiban"]).strip().upper()
@@ -112,11 +146,40 @@ def validate_extracted(value: dict[str, Any]) -> ExtractedData:
     cost = value["otkmkmcost"]
     if isinstance(cost, bool) or not isinstance(cost, int) or not (0 <= cost <= MAX_COST):
         raise ValueError(f"落付見込原価は0以上15桁以内の整数で指定してください: {cost!r}")
+
+    customer_code = str(value["demand_customer_code"]).strip()
+    if not re.fullmatch(r"\d{9}", customer_code):
+        raise ValueError(f"需要家コードは9桁の数字で指定してください: {customer_code!r}")
+
+    customer_name = str(value["demand_customer_name"]).strip()
+    customer_name_kana = str(value["demand_customer_name_kana"]).strip()
+    postal_code = re.sub(r"[-ー－\s]", "", str(value["demand_customer_postal_code"]).strip())
+    customer_address = str(value["demand_customer_address"]).strip()
+    customer_phone = str(value["demand_customer_phone"]).strip()
+    for label, text, limit in (
+        ("需要家名称", customer_name, 40),
+        ("需要家名称カナ", customer_name_kana, 40),
+        ("需要家住所", customer_address, 32),
+        ("需要家電話番号", customer_phone, 16),
+    ):
+        if not text or len(text) > limit:
+            raise ValueError(f"{label}は1～{limit}文字で指定してください: {text!r}")
+    if not re.fullmatch(r"\d{7}", postal_code):
+        raise ValueError(f"需要家郵便番号は7桁の数字で指定してください: {postal_code!r}")
+    if not re.fullmatch(r"[0-9()（）+\-ー－\s]+", customer_phone):
+        raise ValueError(f"需要家電話番号の形式が不正です: {customer_phone!r}")
+
     return ExtractedData(
         seiban=seiban,
         pdf_hansu=pdf_hansu,
         otkmkmnoki=noki,
         otkmkmcost=cost,
+        demand_customer_code=customer_code,
+        demand_customer_name=customer_name,
+        demand_customer_name_kana=customer_name_kana,
+        demand_customer_postal_code=postal_code,
+        demand_customer_address=customer_address,
+        demand_customer_phone=customer_phone,
     )
 
 
