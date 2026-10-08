@@ -245,6 +245,16 @@ def audit_values(now: datetime, config: RtcmConfig) -> dict[str, Any]:
     }
 
 
+def otmkmsdbmn_for_seiban(seiban: str) -> str:
+    """製番の先頭規則から落付見込仕出部門を決定する。"""
+    normalized = seiban.strip().upper()
+    if normalized.startswith("M0") or normalized[:1] in {"A", "G", "H", "K", "L"}:
+        return "361210"
+    if normalized[:1] in {"M", "V"}:
+        return "361220"
+    raise ValueError(f"OTMKMSDBMNを決定できない製番です: {seiban}")
+
+
 def build_row(
     latest: dict[str, Any] | None,
     extracted: ExtractedData,
@@ -271,12 +281,13 @@ def build_row(
             "KOJCD": config.kojcd,
             "SEIBAN": extracted.seiban,
             "HANSU": new_hansu,
-            "GETUDO": now.strftime("%Y%m"),
+            "GETUDO": " ",
             "RECNO": recno,
             "JKYSNHANKG": juchukg,
             "JKYSNEKIKG": jkysn_profit,
             "JKYSNEKIRT": profit_rate(jkysn_profit, juchukg),
             "OTKMKMNOKI": extracted.otkmkmnoki,
+            "OTMKMSDBMN": otmkmsdbmn_for_seiban(extracted.seiban),
             "OTKMKMHNKG": juchukg,
             "OTKMKMCOST": otkmkm_cost,
             "OTKMKMEKI": otkmkm_profit,
@@ -405,6 +416,8 @@ def insert_into_oracle(extracted: ExtractedData, config: RtcmConfig, dry_run: bo
             "seiban": extracted.seiban,
             "pdf_hansu": extracted.pdf_hansu,
             "hansu": row["HANSU"],
+            "getudo": row["GETUDO"],
+            "otmkmsdbmn": row["OTMKMSDBMN"],
             "recno": recno,
             "otkmkmnoki": extracted.otkmkmnoki,
             "otkmkmhnkg": int(juchukg),

@@ -42,6 +42,8 @@ https://genu.n-coke.com/use-case-builder/execute/7ef1d4ea-837d-4870-baf4-28e7cd3
 
 - PDF記載の改訂番号を `pdf_hansu` として取得し、`pdf_hansu = 0` の場合だけ登録します。
 - `T_JUCHUZAN_CTL` から現在の受注金額 `JUCHUKG` を取得します。
+- `T_JYOSAN.GETUDO` は画面の新規登録結果に合わせ、半角スペース1文字を設定します。
+- `T_JYOSAN.OTMKMSDBMN` は製番が `A`、`G`、`H`、`K`、`L`、`M0` で始まる場合は栃木機器設計グループ（`361210`）、`M0` 以外の `M` または `V` で始まる場合は栃木装置グループ（`361220`）を設定します。規則にない製番は誤登録防止のためエラーにします。
 - 既存行がある場合、最大 `HANSU` の全項目を引き継ぎ、`HANSU + 1` でINSERTします。
 - 既存行がない場合は `HANSU = 0` でINSERTし、未指定列はテーブルの既定値を使用します。
 - `RECNO` は `SQ_T_JYOSAN01.NEXTVAL` で採番します。
@@ -171,7 +173,7 @@ DBコミット後のPDF移動に失敗した場合は、重複登録防止のた
 ## 注意事項
 
 - 本番投入前に、`T_JYOSAN` の主キーが `(KAICD, KYOTENCD, KOJCD, SEIBAN, HANSU)` であること、`T_JUCHUZAN_CTL.JUCHUKG` が現在販価として正しいことをテスト環境で確認してください。
-- 初版では前版から引き継げない `OTMKMSDBMN`、販売分析項目、機種項目などはテーブル既定値になります。初版にも別テーブル由来の値が必要なら、その取得元を確定して追加してください。
+- 初版では `OTMKMSDBMN` を製番の先頭規則から設定します。販売分析項目、機種項目など、その他の未指定列はテーブル既定値になります。
 - DocuWorks PDFのプリンタ名と固定出力先は、それぞれ `DOCUWORKS_PDF_PRINTER`、`DOCUWORKS_PDF_OUTPUT_FOLDER` で設定します。現在の想定出力先は `C:\DocuWorksPdfOut` です。
 - 監視プログラムはEdgeとDocuWorksの画面を操作するため、ユーザーがログオンしている対話セッションで実行してください。Windowsサービスのセッション0では動作しません。
 - 生成AI画面のHTML構造が変更された場合は、`genu_browser.py` のセレクター調整が必要です。

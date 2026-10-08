@@ -14,6 +14,7 @@ from import_jyosan import (
     build_row,
     insert_into_oracle,
     load_config_env,
+    otmkmsdbmn_for_seiban,
     profit_rate,
     validate_extracted,
 )
@@ -211,7 +212,10 @@ class ImportJyosanTest(unittest.TestCase):
             subject, body = build_notification(
                 "success",
                 Path("A2433.pdf"),
-                {"extracted": {"seiban": "A2433"}, "database": {"hansu": 37}},
+                {
+                    "extracted": {"seiban": "A2433"},
+                    "database": {"hansu": 37},
+                },
             )
             self.assertIn("成功", subject)
             self.assertIn("製番: A2433", body)
@@ -322,8 +326,16 @@ class ImportJyosanTest(unittest.TestCase):
             "OTKMKMSDBMN": "361220",
             "BIKO": " ",
         }
-        row = build_row(latest, self.extracted, self.config, Decimal(4_800_000), 148065, self.now)
+        row = build_row(
+            latest,
+            self.extracted,
+            self.config,
+            Decimal(4_800_000),
+            148065,
+            self.now,
+        )
         self.assertEqual(row["HANSU"], 3)
+        self.assertEqual(row["GETUDO"], " ")
         self.assertEqual(row["RECNO"], 148065)
         self.assertEqual(row["JKYSNHANKG"], Decimal(4_800_000))
         self.assertEqual(row["JKYSNEKIKG"], Decimal(1_783_863))
@@ -334,11 +346,30 @@ class ImportJyosanTest(unittest.TestCase):
         self.assertEqual(row["OTKMKMSDBMN"], "361220")
 
     def test_no_existing_row_creates_hansu_0(self):
-        row = build_row(None, self.extracted, self.config, Decimal(4_800_000), 148065, self.now)
+        row = build_row(
+            None,
+            self.extracted,
+            self.config,
+            Decimal(4_800_000),
+            148065,
+            self.now,
+        )
         self.assertEqual(row["HANSU"], 0)
+        self.assertEqual(row["GETUDO"], " ")
+        self.assertEqual(row["OTMKMSDBMN"], "361220")
         # 初版の未指定列（JKYSNCOST等）はINSERT時にテーブル既定値を使用する。
         self.assertNotIn("JKYSNCOST", row)
         self.assertEqual(row["JKYSNEKIRT"], Decimal("100.00"))
+
+    def test_otmkmsdbmn_is_derived_from_seiban_prefix(self):
+        for seiban in ("A0907", "G1234", "H1234", "K1234", "L1801", "M0123"):
+            with self.subTest(seiban=seiban):
+                self.assertEqual(otmkmsdbmn_for_seiban(seiban), "361210")
+        for seiban in ("M1123", "M9123", "V3579"):
+            with self.subTest(seiban=seiban):
+                self.assertEqual(otmkmsdbmn_for_seiban(seiban), "361220")
+        with self.assertRaisesRegex(ValueError, "決定できない製番"):
+            otmkmsdbmn_for_seiban("B1234")
 
 
 if __name__ == "__main__":
