@@ -130,6 +130,28 @@ python .\watch_folder.py --once --dry-run
 
 `--once` 指定時はスケジュールを待たず、現在のキューを手動で即時処理します。また、前回エラーになった同一ファイルも自動的に再試行します。
 
+### C1倉庫登録だけを実行する
+
+RTCMを更新せずC1倉庫登録だけを行う場合は、対象PDFまたは抽出済みJSONを指定します。PDF指定時は生成AIへアップロードしてRTCM・需要家情報を抽出します。JSON指定時は生成AIを起動せず、JSONを検証して直接C1へ登録します。このモードではOracle接続、RTCM更新、通常の監視キュー処理は行いません。明示的な専用実行のため、`C1_WAREHOUSE_ENABLED` の値に関係なくC1処理を実行します。
+
+```powershell
+python .\watch_folder.py --c1-only C:\PDF\L1801-00-S.pdf
+```
+
+抽出済みJSONから直接C1へ登録する場合は次のように指定します。
+
+```powershell
+python .\watch_folder.py --c1-only C:\PDF\L1801.json
+```
+
+登録前の確認では `--dry-run` を併用します。この場合はC1へ書き込みません。
+
+```powershell
+python .\watch_folder.py --c1-only C:\PDF\L1801-00-S.pdf --dry-run
+```
+
+正規化・検証済みの抽出結果は `RTCM_WORK_FOLDER\c1-only\<SHA256先頭16桁>\extracted.json`、実行結果は同じフォルダの `c1_only_result.json` に保存します。成功・失敗の履歴は `RTCM_WORK_FOLDER\logs\c1-only.jsonl` に追記します。
+
 確認後、次のコマンドで継続監視します。
 
 ```powershell
@@ -150,6 +172,12 @@ EXEは同じフォルダにある外部設定ファイルを読み込みます�
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 .\dist\rtcm_ai_jyosan_import\rtcm_ai_jyosan_import.exe --once --dry-run
+```
+
+C1倉庫登録だけを行う場合:
+
+```powershell
+.\dist\rtcm_ai_jyosan_import\rtcm_ai_jyosan_import.exe --c1-only C:\PDF\L1801-00-S.pdf
 ```
 
 前回エラーになった同一ファイルを再試行するときは次のようにします。

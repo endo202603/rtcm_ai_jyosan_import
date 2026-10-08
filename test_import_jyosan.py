@@ -1,12 +1,15 @@
+import json
 import unittest
 import os
+import sys
 import tempfile
+import types
 from datetime import datetime, time as datetime_time
 from decimal import Decimal
 from pathlib import Path
 
 from c1_browser import C1WarehouseBrowser
-from genu_browser import parse_json_from_result
+from genu_browser import parse_json_from_result, save_windows_credential
 from notifier import build_notification, load_notify_config
 from import_jyosan import (
     ExtractedData,
@@ -27,6 +30,7 @@ from watch_folder import (
     latest_weekday_batch_cutoff,
     parse_batch_time,
     pdf_upload_name,
+    process_c1_only,
     queue_copy_path,
     xdw_print_name,
 )
@@ -396,6 +400,173 @@ class ImportJyosanTest(unittest.TestCase):
         self.assertEqual(result["display_name"], "V3579 太陽誘電")
         self.assertEqual(result["name_kana"], "V3579 ﾀｲﾖｳﾕｳﾃﾞﾝ")
 
+    def test_c1_browser_does_not_stop_shared_playwright(self):
+        class FakePlaywright:
+            def __init__(self):
+                self.stop_called = False
+
+            def stop(self):
+                self.stop_called = True
+
+        shared_playwright = FakePlaywright()
+        browser = C1WarehouseBrowser(playwright=shared_playwright)
+        browser.close()
+        self.assertFalse(shared_playwright.stop_called)
+        self.assertIs(browser._playwright, shared_playwright)
+
+    def test_windows_credential_is_saved_as_unicode(self):
+        captured = {}
+
+        def cred_write(credential, flags):
+            captured.update(credential)
+            captured["flags"] = flags
+
+        fake_win32cred = types.SimpleNamespace(
+            CRED_TYPE_GENERIC=1,
+            CRED_PERSIST_LOCAL_MACHINE=2,
+            CredWrite=cred_write,
+        )
+        original = sys.modules.get("win32cred")
+        sys.modules["win32cred"] = fake_win32cred
+        try:
+            save_windows_credential("C1_Auto_Fill: test", "user", "日本語pass")
+        finally:
+            if original is None:
+                sys.modules.pop("win32cred", None)
+            else:
+                sys.modules["win32cred"] = original
+
+        self.assertEqual(captured["CredentialBlob"], "日本語pass")
+        self.assertIsInstance(captured["CredentialBlob"], str)
+
+    def test_exe_build_includes_win32_credential_dependencies(self):
+        build_script = (Path(__file__).parent / "build_exe.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--hidden-import win32cred", build_script)
+        self.assertIn("--hidden-import win32timezone", build_script)
+        self.assertIn("--hidden-import pywintypes", build_script)
+
+    def test_hidden_c1_warehouse_menu_is_activated_by_dom_click(self):
+        class FakeLocator:
+            def __init__(self, count, calls):
+                self._count = count
+                self.calls = calls
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return self._count
+
+            def evaluate(self, script):
+                self.calls.append(("evaluate", script))
+
+        class FakePage:
+            def __init__(self):
+                self.calls = []
+
+            def locator(self, selector):
+                self.calls.append(("locator", selector))
+                if ":visible" in selector:
+                    return FakeLocator(0, self.calls)
+                return FakeLocator(1, self.calls)
+
+            def wait_for_timeout(self, timeout):
+                self.calls.append(("wait", timeout))
+
+            def goto(self, *args, **kwargs):
+                self.calls.append(("goto", args, kwargs))
+
+        browser = C1WarehouseBrowser()
+        browser.page = FakePage()
+        browser._activate_warehouse_menu()
+        self.assertTrue(any(call[0] == "evaluate" for call in browser.page.calls))
+        self.assertFalse(any(call[0] == "goto" for call in browser.page.calls))
+
+    def test_c1_logged_in_is_detected_by_logout_on_main_page(self):
+        class FakeLocator:
+            def __init__(self, count=0, value=""):
+                self._count = count
+                self._value = value
+
+            def count(self):
+                return self._count
+
+            def input_value(self):
+                return self._value
+
+        class FakePage:
+            def locator(self, selector):
+                if selector == "#logout":
+                    return FakeLocator(count=1)
+                return FakeLocator()
+
+        browser = C1WarehouseBrowser()
+        browser.page = FakePage()
+        self.assertTrue(browser._logged_in())
+
+    def test_c1_code_search_switches_to_inquiry_mode_only_once(self):
+        browser = C1WarehouseBrowser()
+        switched = []
+        inquiries = []
+        browser._switch_mode = switched.append
+
+        def inquire(code):
+            inquiries.append(code)
+            if len(inquiries) == 1:
+                return {
+                    "warehouse_code": code,
+                    "name": "別需要家",
+                    "display_name": "V0000 別需要家",
+                    "name_kana": "V0000 ﾍﾞﾂｼﾞｭﾖｳｶ",
+                }
+            return None
+
+        browser._inquire = inquire
+        code, already_registered = browser._find_code(self.extracted)
+        self.assertEqual(switched, ["#mode_inquire"])
+        self.assertEqual(inquiries, ["EG746", "EG747"])
+        self.assertEqual(code, "EG747")
+        self.assertFalse(already_registered)
+
+    def test_c1_clear_confirmation_is_accepted(self):
+        calls = []
+
+        class FakeButton:
+            def click(self, timeout):
+                calls.append(("click", timeout))
+
+        class FakeDialog:
+            def filter(self, has_text):
+                calls.append(("filter", has_text))
+                return self
+
+            def count(self):
+                return 1
+
+            @property
+            def first(self):
+                return self
+
+            def get_by_role(self, role, name, exact):
+                calls.append(("role", role, name, exact))
+                return FakeButton()
+
+        class FakePage:
+            def locator(self, selector):
+                calls.append(("locator", selector))
+                return FakeDialog()
+
+            def wait_for_timeout(self, timeout):
+                calls.append(("wait", timeout))
+
+        browser = C1WarehouseBrowser()
+        browser.page = FakePage()
+        self.assertTrue(browser._accept_clear_confirmation())
+        self.assertTrue(any(call[0] == "click" for call in calls))
+
     def test_customer_address_length_is_checked_for_c1_field(self):
         with self.assertRaises(ValueError):
             validate_extracted(
@@ -407,6 +578,75 @@ class ImportJyosanTest(unittest.TestCase):
                     **{**self.customer, "demand_customer_address": "あ" * 33},
                 }
             )
+
+    def test_c1_only_extracts_pdf_and_never_updates_rtcm(self):
+        class FakeGenuBrowser:
+            def __init__(self, extracted):
+                self.extracted = extracted
+                self.uploaded_pdf = None
+
+            def extract(self, pdf_path):
+                self.uploaded_pdf = pdf_path
+                return self.extracted
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_pdf = root / "V 3579.pdf"
+            source_pdf.write_bytes(b"%PDF-1.4\n")
+            fake_browser = FakeGenuBrowser(self.extracted)
+            result = process_c1_only(
+                source_pdf,
+                fake_browser,
+                root / "work",
+                C1WarehouseBrowser(),
+                dry_run=True,
+            )
+            self.assertEqual(result["mode"], "c1_only")
+            self.assertEqual(result["input_type"], "pdf")
+            self.assertEqual(result["database"]["status"], "not_run")
+            self.assertFalse(result["database"]["committed"])
+            self.assertEqual(result["c1_warehouse"]["status"], "dry_run")
+            self.assertEqual(fake_browser.uploaded_pdf.name, "V3579.pdf")
+            self.assertTrue(Path(result["extracted_json"]).is_file())
+            result_path = Path(result["result_json"])
+            self.assertTrue(result_path.is_file())
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["extracted"]["seiban"], "V3579")
+
+    def test_c1_only_reads_json_without_generative_ai(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_json = root / "M7604.json"
+            source_json.write_text(
+                json.dumps(self.extracted.__dict__, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result = process_c1_only(
+                source_json,
+                None,
+                root / "work",
+                C1WarehouseBrowser(),
+                dry_run=True,
+            )
+            self.assertEqual(result["input_type"], "json")
+            self.assertEqual(result["source_json"], str(source_json.resolve()))
+            self.assertNotIn("upload_pdf", result)
+            self.assertEqual(result["extracted"]["seiban"], "V3579")
+            self.assertEqual(result["c1_warehouse"]["status"], "dry_run")
+
+    def test_c1_only_rejects_unsupported_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "extracted.txt"
+            source.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "PDFまたはJSONファイル"):
+                process_c1_only(
+                    source,
+                    object(),
+                    Path(directory) / "work",
+                    C1WarehouseBrowser(),
+                    dry_run=True,
+                )
+
     def test_otmkmsdbmn_is_derived_from_seiban_prefix(self):
         for seiban in ("A0907", "G1234", "H1234", "K1234", "L1801", "M0123"):
             with self.subTest(seiban=seiban):

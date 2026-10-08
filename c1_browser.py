@@ -20,7 +20,7 @@ DEFAULT_WAREHOUSE_URL = (
 class C1WarehouseBrowser:
     """C1倉庫登録を行う。ブラウザは最初の登録時まで起動しない。"""
 
-    def __init__(self) -> None:
+    def __init__(self, playwright=None) -> None:
         self.login_url = os.getenv("C1_LOGIN_URL", DEFAULT_LOGIN_URL).strip()
         self.warehouse_url = os.getenv("C1_WAREHOUSE_URL", DEFAULT_WAREHOUSE_URL).strip()
         self.credential_target = os.getenv(
@@ -31,7 +31,11 @@ class C1WarehouseBrowser:
         self.code_prefix = os.getenv("C1_WAREHOUSE_CODE_PREFIX", "EG").strip().upper()
         self.code_start = int(os.getenv("C1_WAREHOUSE_CODE_START", "746"))
         self.timeout_ms = int(os.getenv("C1_TIMEOUT_SECONDS", "180")) * 1000
-        self._playwright = None
+        # sync_playwright().start() を同一スレッドで二重に呼ぶと、既存の
+        # Playwright同期APIが動作中であっても asyncio loop 内実行と判定される。
+        # 生成AIブラウザと併用する場合は、その実行基盤を共有する。
+        self._playwright = playwright
+        self._owns_playwright = playwright is None
         self.context = None
         self.page = None
         self._validate_settings()
@@ -50,10 +54,12 @@ class C1WarehouseBrowser:
     def _start(self) -> None:
         if self.context is not None:
             return
-        from playwright.sync_api import sync_playwright
-
         self.profile.mkdir(parents=True, exist_ok=True)
-        self._playwright = sync_playwright().start()
+        if self._playwright is None:
+            from playwright.sync_api import sync_playwright
+
+            self._playwright = sync_playwright().start()
+            self._owns_playwright = True
         self.context = self._playwright.chromium.launch_persistent_context(
             str(self.profile),
             channel="msedge",
@@ -70,7 +76,7 @@ class C1WarehouseBrowser:
                 pass
             self.context = None
             self.page = None
-        if self._playwright is not None:
+        if self._owns_playwright and self._playwright is not None:
             try:
                 self._playwright.stop()
             except Exception:
@@ -84,6 +90,28 @@ class C1WarehouseBrowser:
             or self.page.locator("#c1_menu_AX040010").count() > 0
         )
 
+    def _logged_in(self) -> bool:
+        """C1の認証済みメイン画面または倉庫登録画面かを判定する。"""
+        assert self.page is not None
+        if self._warehouse_available() or self._menu_available():
+            return True
+        if self.page.locator("#logout").count() > 0:
+            return True
+        user_id = self.page.locator("#__az_user_id")
+        return bool(user_id.count() and user_id.input_value().strip())
+
+    def _wait_for_logged_in(self, timeout_ms: int) -> None:
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            try:
+                if self._logged_in():
+                    return
+            except Exception:
+                # 画面遷移中は一時的にDOMへアクセスできないことがある。
+                pass
+            time.sleep(0.25)
+        raise TimeoutError("C1のログイン完了を確認できませんでした")
+
     def _warehouse_available(self, page=None) -> bool:
         target = page or self.page
         return bool(target and target.locator("#mode_new").count() and target.locator("#txstr_suk_cd").count())
@@ -92,15 +120,13 @@ class C1WarehouseBrowser:
         self._start()
         assert self.page is not None
         self.page.goto(self.login_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-        if self._menu_available():
+        if self._logged_in():
             return
 
         username = self.page.locator("#txstr_userid")
         password = self.page.locator("#txstr_password")
         if not username.count() or not password.count():
-            self.page.wait_for_selector(
-                'a[_c1_target="AX040010"], #c1_menu_AX040010', timeout=self.timeout_ms
-            )
+            self._wait_for_logged_in(self.timeout_ms)
             return
 
         credential = read_windows_credential(self.credential_target)
@@ -109,11 +135,9 @@ class C1WarehouseBrowser:
             password.fill(credential.password)
             self._click_and_settle(self.page.locator("#set"))
             try:
-                self.page.wait_for_selector(
-                    'a[_c1_target="AX040010"], #c1_menu_AX040010', timeout=60_000
-                )
+                self._wait_for_logged_in(60_000)
                 return
-            except Exception:
+            except TimeoutError:
                 print(
                     "C1の保存済み資格情報でログインできませんでした。"
                     "ブラウザで手動ログインしてください。",
@@ -132,7 +156,7 @@ class C1WarehouseBrowser:
         last_password = ""
         deadline = time.monotonic() + (self.timeout_ms / 1000)
         while time.monotonic() < deadline:
-            if self._menu_available():
+            if self._logged_in():
                 if last_username and last_password:
                     save_windows_credential(
                         self.credential_target, last_username, last_password
@@ -158,20 +182,59 @@ class C1WarehouseBrowser:
             pass
         self.page.wait_for_timeout(300)
 
+    def _accept_clear_confirmation(self) -> bool:
+        """モード切替時に表示されるC1のクリア確認を承認する。"""
+        assert self.page is not None
+        dialog = self.page.locator(".ui-dialog:visible").filter(
+            has_text="クリアしてもよろしいですか"
+        )
+        if not dialog.count():
+            return False
+        dialog.first.get_by_role("button", name="OK", exact=True).click(
+            timeout=self.timeout_ms
+        )
+        self.page.wait_for_timeout(300)
+        return True
+
+    def _switch_mode(self, selector: str) -> None:
+        assert self.page is not None
+        self._click_and_settle(self.page.locator(selector))
+        self._accept_clear_confirmation()
+
+    def _activate_warehouse_menu(self) -> None:
+        """表示中の倉庫登録リンクを優先し、非表示メニューにも対応する。"""
+        assert self.page is not None
+        visible_menu = self.page.locator(
+            'a[_c1_target="AX040010"]:visible, #c1_menu_AX040010:visible'
+        ).first
+        if visible_menu.count():
+            self._click_and_settle(visible_menu)
+            return
+
+        # C1は画面幅やメニュー状態により、同じリンクを非表示要素として持つ。
+        # Playwrightの通常clickは非表示要素を待ち続けるため、DOM clickでonclickを実行する。
+        hidden_menu = self.page.locator(
+            'a[_c1_target="AX040010"], #c1_menu_AX040010'
+        ).first
+        if hidden_menu.count():
+            hidden_menu.evaluate("element => element.click()")
+            self.page.wait_for_timeout(300)
+            return
+
+        self.page.goto(
+            self.warehouse_url,
+            wait_until="domcontentloaded",
+            timeout=self.timeout_ms,
+        )
+
     def open_warehouse(self) -> None:
         self.ensure_logged_in()
         assert self.context is not None and self.page is not None
         if self._warehouse_available():
             return
 
-        menu = self.page.locator('a[_c1_target="AX040010"]').first
-        if not menu.count():
-            menu = self.page.locator("#c1_menu_AX040010")
         before_pages = list(self.context.pages)
-        if menu.count():
-            menu.click()
-        else:
-            self.page.goto(self.warehouse_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self._activate_warehouse_menu()
 
         deadline = time.monotonic() + (self.timeout_ms / 1000)
         while time.monotonic() < deadline:
@@ -186,7 +249,6 @@ class C1WarehouseBrowser:
 
     def _inquire(self, warehouse_code: str) -> dict[str, str] | None:
         assert self.page is not None
-        self._click_and_settle(self.page.locator("#mode_inquire"))
         self.page.locator("#txstr_suk_cd").fill(warehouse_code)
         self._click_and_settle(self.page.locator("#search"))
         name = self.page.locator("#txstr_suk_mei").input_value().strip()
@@ -220,6 +282,9 @@ class C1WarehouseBrowser:
 
     def _find_code(self, data: ExtractedData) -> tuple[str, bool]:
         expected_display = self._display_name(data)
+        # 照会モードへの切替は採番処理の開始時に1回だけ行う。
+        # 候補ごとに押すと、前回の照会結果を消す確認ダイアログが毎回表示される。
+        self._switch_mode("#mode_inquire")
         for code in self._candidate_codes():
             existing = self._inquire(code)
             if existing is None:
@@ -266,7 +331,7 @@ class C1WarehouseBrowser:
         if already_registered:
             return {**base_result, "status": "already_registered", "registered": True}
 
-        self._click_and_settle(self.page.locator("#mode_new"))
+        self._switch_mode("#mode_new")
         values = {
             "#txstr_suk_cd": warehouse_code,
             "#txstr_suk_mei": data.demand_customer_name,

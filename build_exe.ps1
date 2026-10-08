@@ -19,6 +19,7 @@ try {
         --collect-all oracledb `
         --collect-all cryptography `
         --hidden-import win32cred `
+        --hidden-import win32timezone `
         --hidden-import pywintypes `
         watch_folder.py
 
