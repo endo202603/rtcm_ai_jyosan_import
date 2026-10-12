@@ -30,6 +30,14 @@ from xdw_converter import convert_xdw_to_pdf
 SUPPORTED_EXTENSIONS = {".pdf", ".xdw"}
 
 
+class C1WarehouseRegistrationError(RuntimeError):
+    """RTCM committed successfully, but the subsequent C1 registration failed."""
+
+    def __init__(self, message, partial_result):
+        super().__init__(message)
+        self.partial_result = partial_result
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -403,9 +411,10 @@ def process_file(
                 json.dumps(partial_result, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
             )
-            raise RuntimeError(
+            raise C1WarehouseRegistrationError(
                 "RTCM登録は成功しましたが、C1倉庫登録に失敗しました。"
-                f"再実行時はRTCM登録済みチェックポイントを再利用します: {exc}"
+                f"再実行時はRTCM登録済みチェックポイントを再利用します: {exc}",
+                partial_result,
             ) from exc
         print(f"C1倉庫登録完了: {json.dumps(c1_result, ensure_ascii=False)}", flush=True)
     else:
@@ -661,6 +670,11 @@ def main() -> int:
                         source.unlink(missing_ok=True)
                 except Exception as exc:
                     error_detail = "".join(traceback.format_exception(exc))
+                    notification_result = (
+                        exc.partial_result
+                        if isinstance(exc, C1WarehouseRegistrationError)
+                        else None
+                    )
                     state.record(digest, original_source, "error", error=error_detail)
                     append_log(
                         log_path,
@@ -674,7 +688,11 @@ def main() -> int:
                     )
                     print(f"ERROR {original_source}: {exc}", file=sys.stderr)
                     notify_error = None if args.dry_run else notify_safely(
-                        notify_config, "error", original_source, error=error_detail
+                        notify_config,
+                        "error",
+                        original_source,
+                        result=notification_result,
+                        error=error_detail,
                     )
                     if notify_error:
                         append_log(log_path, {"status": "notification_error", "sha256": digest, "error": notify_error})

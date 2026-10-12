@@ -19,6 +19,7 @@ try {
         --collect-all oracledb `
         --collect-all cryptography `
         --hidden-import win32cred `
+        --hidden-import win32clipboard `
         --hidden-import win32timezone `
         --hidden-import pywintypes `
         watch_folder.py
@@ -44,6 +45,29 @@ try {
     Copy-Item -Force -LiteralPath (Join-Path $ProjectDir "notify.json") -Destination $OutputDir
     Copy-Item -Force -LiteralPath (Join-Path $ProjectDir "prompt.txt") -Destination $OutputDir
     Copy-Item -Force -LiteralPath (Join-Path $ProjectDir "README.md") -Destination $OutputDir
+
+    # Always recreate the launch shortcuts. Copying an old distribution folder can
+    # otherwise leave an absolute target pointing at a previous project checkout.
+    $ShortcutShell = New-Object -ComObject WScript.Shell
+    $Shortcuts = @(
+        @{
+            Name = "【エラー済みファイルを再実行】rtcm_ai_jyosan_import.exe - ショートカット.lnk"
+            Arguments = "--retry-errors"
+        },
+        @{
+            Name = "【PDF,JSONドラッグアンドドロップでC1のみ登録】rtcm_ai_jyosan_import.exe - ショートカット.lnk"
+            Arguments = "--c1-only"
+        }
+    )
+    foreach ($ShortcutDefinition in $Shortcuts) {
+        $ShortcutPath = Join-Path $OutputDir $ShortcutDefinition.Name
+        $Shortcut = $ShortcutShell.CreateShortcut($ShortcutPath)
+        $Shortcut.TargetPath = $OutputExe
+        $Shortcut.Arguments = $ShortcutDefinition.Arguments
+        $Shortcut.WorkingDirectory = $OutputDir
+        $Shortcut.IconLocation = "$OutputExe,0"
+        $Shortcut.Save()
+    }
     Write-Host "Build complete: $OutputDir"
 }
 finally {

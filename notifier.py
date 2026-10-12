@@ -54,8 +54,18 @@ def load_notify_config(path: Path) -> NotifyConfig | None:
 def build_notification(status: str, source: Path, result: dict[str, Any] | None, error: str = "") -> tuple[str, str]:
     success = status == "success"
     skipped = status == "skipped"
+    c1_failed_after_rtcm = bool(
+        status == "error"
+        and result
+        and result.get("database", {}).get("committed")
+        and result.get("c1_warehouse", {}).get("status") == "error"
+    )
     status_label = "成功" if success else "スキップ" if skipped else "失敗"
-    subject = f"{status_label}: {source.name}"
+    subject = (
+        f"C1倉庫登録失敗（RTCM登録成功）: {source.name}"
+        if c1_failed_after_rtcm
+        else f"{status_label}: {source.name}"
+    )
     lines = [
         f"処理結果: {status_label}",
         f"対象ファイル: {source}",
@@ -98,6 +108,26 @@ def build_notification(status: str, source: Path, result: dict[str, Any] | None,
         )
         if result.get("archive_error"):
             lines.append(f"PDF保管エラー: {result['archive_error']}")
+    elif c1_failed_after_rtcm and result:
+        extracted = result.get("extracted", {})
+        database = result.get("database", {})
+        c1_warehouse = result.get("c1_warehouse", {})
+        lines.extend(
+            [
+                "RTCM登録結果: 成功",
+                f"製番: {extracted.get('seiban', '')}",
+                f"PDF版数: {extracted.get('pdf_hansu', '')}",
+                f"RTCM登録版数: {database.get('hansu', '')}",
+                f"RECNO: {database.get('recno', '')}",
+                "C1倉庫登録結果: 失敗",
+                f"需要家コード: {extracted.get('demand_customer_code', '')}",
+                f"需要家名称: {extracted.get('demand_customer_name', '')}",
+                f"C1エラー: {c1_warehouse.get('error', '')}",
+                "RTCMは登録済みです。RTCMを重複登録せず、C1倉庫登録のみ再実行してください。",
+            ]
+        )
+        if error:
+            lines.extend(["", "エラー詳細:", error])
     elif error:
         lines.extend(["", "エラー内容:", error])
         if "T_JUCHUZAN_CTLに対象製番がありません" in error:
