@@ -62,7 +62,9 @@ def save_windows_credential(target: str, username: str, password: str) -> None:
             "Type": win32cred.CRED_TYPE_GENERIC,
             "TargetName": target,
             "UserName": username,
-            "CredentialBlob": password.encode("utf-16-le"),
+            # pywin32 の Unicode 版 CredWrite は文字列を受け取り、Windows側で
+            # CredentialBlobへ変換する。bytesを渡すと環境によってTypeErrorになる。
+            "CredentialBlob": password,
             "Comment": "RTCM AI取込 - genu.n-coke.com",
             "Persist": win32cred.CRED_PERSIST_LOCAL_MACHINE,
         },
@@ -99,6 +101,11 @@ class GenuBrowser:
         )
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.ensure_logged_in()
+
+    @property
+    def playwright(self):
+        """他のブラウザ処理と共有するPlaywright実行基盤を返す。"""
+        return self._playwright
 
     def close(self) -> None:
         try:

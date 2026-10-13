@@ -15,12 +15,27 @@ from pathlib import Path
 
 from c1_browser import C1WarehouseBrowser
 from genu_browser import GenuBrowser
-from import_jyosan import JST, RtcmConfig, application_dir, insert_into_oracle, required_env
+from import_jyosan import (
+    JST,
+    RtcmConfig,
+    application_dir,
+    insert_into_oracle,
+    required_env,
+    validate_extracted,
+)
 from notifier import build_notification, load_notify_config, send_notification
 from xdw_converter import convert_xdw_to_pdf
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".xdw"}
+
+
+class C1WarehouseRegistrationError(RuntimeError):
+    """RTCM committed successfully, but the subsequent C1 registration failed."""
+
+    def __init__(self, message, partial_result):
+        super().__init__(message)
+        self.partial_result = partial_result
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -396,9 +411,10 @@ def process_file(
                 json.dumps(partial_result, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
             )
-            raise RuntimeError(
+            raise C1WarehouseRegistrationError(
                 "RTCM登録は成功しましたが、C1倉庫登録に失敗しました。"
-                f"再実行時はRTCM登録済みチェックポイントを再利用します: {exc}"
+                f"再実行時はRTCM登録済みチェックポイントを再利用します: {exc}",
+                partial_result,
             ) from exc
         print(f"C1倉庫登録完了: {json.dumps(c1_result, ensure_ascii=False)}", flush=True)
     else:
@@ -426,16 +442,138 @@ def process_file(
     return result
 
 
+def process_c1_only(
+    source: Path,
+    browser: GenuBrowser | None,
+    work_folder: Path,
+    c1_browser: C1WarehouseBrowser,
+    dry_run: bool,
+) -> dict:
+    """PDFまたは抽出済みJSONから、Oracleを使用せずC1だけを登録する。"""
+    source_file = source.expanduser().resolve()
+    if not source_file.is_file():
+        raise FileNotFoundError(f"C1倉庫登録対象ファイルが見つかりません: {source_file}")
+    input_type = source_file.suffix.lower()
+    if input_type not in {".pdf", ".json"}:
+        raise ValueError(
+            f"--c1-only にはPDFまたはJSONファイルを指定してください: {source_file}"
+        )
+
+    digest = file_hash(source_file)
+    job_folder = work_folder / "c1-only" / digest[:16]
+    job_folder.mkdir(parents=True, exist_ok=True)
+    upload_pdf = None
+    if input_type == ".pdf":
+        if browser is None:
+            raise RuntimeError("PDF入力には生成AIブラウザが必要です")
+        upload_pdf = job_folder / pdf_upload_name(source_file)
+        if source_file != upload_pdf.resolve():
+            shutil.copy2(source_file, upload_pdf)
+        print(f"C1専用実行: 生成AIへアップロードします: {upload_pdf.name}", flush=True)
+        extracted = browser.extract(upload_pdf)
+        print(f"C1専用実行: 生成AI抽出完了: {extracted.seiban}", flush=True)
+    else:
+        print(f"C1専用実行: JSONを読み込みます: {source_file.name}", flush=True)
+        try:
+            payload = json.loads(source_file.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"C1専用実行のJSON形式が不正です: {exc}") from exc
+        extracted = validate_extracted(payload)
+        print(f"C1専用実行: JSON検証完了: {extracted.seiban}", flush=True)
+
+    extracted_path = job_folder / "extracted.json"
+    extracted_path.write_text(
+        json.dumps(extracted.__dict__, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    c1_result = c1_browser.register(extracted, dry_run=dry_run)
+    result = {
+        "mode": "c1_only",
+        "input_type": input_type.removeprefix("."),
+        "source_file": str(source_file),
+        "extracted_json": str(extracted_path),
+        "extracted": extracted.__dict__,
+        "database": {
+            "status": "not_run",
+            "committed": False,
+            "reason": "C1専用実行のためRTCM更新は行っていません。",
+        },
+        "c1_warehouse": c1_result,
+    }
+    if input_type == ".pdf":
+        result["source_pdf"] = str(source_file)
+        result["upload_pdf"] = str(upload_pdf)
+    else:
+        result["source_json"] = str(source_file)
+    output_path = job_folder / "c1_only_result.json"
+    output_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    result["result_json"] = str(output_path)
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PDF/XDW監視フォルダからRTCM落付見込を自動登録します")
     parser.add_argument("--once", action="store_true", help="現在あるファイルを処理して終了")
     parser.add_argument("--dry-run", action="store_true", help="DB登録をROLLBACK")
     parser.add_argument("--retry-errors", action="store_true", help="前回エラーの同一ファイルを再実行")
+    parser.add_argument(
+        "--c1-only",
+        type=Path,
+        metavar="INPUT_FILE",
+        help=(
+            "PDFを生成AIへアップロードするか抽出済みJSONを読み込み、"
+            "RTCMを更新せずC1倉庫登録だけを即時実行"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.c1_only is not None:
+        work_folder = Path(required_env("RTCM_WORK_FOLDER"))
+        work_folder.mkdir(parents=True, exist_ok=True)
+        log_path = work_folder / "logs" / "c1-only.jsonl"
+        browser = None
+        c1_browser = None
+        try:
+            input_suffix = args.c1_only.suffix.lower()
+            if input_suffix == ".pdf":
+                browser = GenuBrowser()
+                c1_browser = C1WarehouseBrowser(playwright=browser.playwright)
+            else:
+                # JSON入力では生成AIを一切起動せず、C1専用ブラウザだけを使用する。
+                c1_browser = C1WarehouseBrowser()
+            result = process_c1_only(
+                args.c1_only, browser, work_folder, c1_browser, args.dry_run
+            )
+            append_log(
+                log_path,
+                {
+                    "status": "dry_run" if args.dry_run else "success",
+                    "source": str(args.c1_only),
+                    **result,
+                },
+            )
+            print(json.dumps(result, ensure_ascii=False, default=str))
+            return 0
+        except Exception as exc:
+            append_log(
+                log_path,
+                {
+                    "status": "error",
+                    "source": str(args.c1_only),
+                    "error": "".join(traceback.format_exception(exc)),
+                },
+            )
+            raise
+        finally:
+            if c1_browser is not None:
+                c1_browser.close()
+            if browser is not None:
+                browser.close()
+
     watch_folder = Path(required_env("RTCM_WATCH_FOLDER"))
     work_folder = Path(required_env("RTCM_WORK_FOLDER"))
     poll_seconds = int(os.getenv("RTCM_POLL_SECONDS", "3"))
@@ -456,7 +594,7 @@ def main() -> int:
     notify_config = load_notify_config(notify_path)
 
     browser = GenuBrowser()
-    c1_browser = C1WarehouseBrowser()
+    c1_browser = C1WarehouseBrowser(playwright=browser.playwright)
     try:
         while True:
             now = datetime.now(JST)
@@ -532,6 +670,11 @@ def main() -> int:
                         source.unlink(missing_ok=True)
                 except Exception as exc:
                     error_detail = "".join(traceback.format_exception(exc))
+                    notification_result = (
+                        exc.partial_result
+                        if isinstance(exc, C1WarehouseRegistrationError)
+                        else None
+                    )
                     state.record(digest, original_source, "error", error=error_detail)
                     append_log(
                         log_path,
@@ -545,7 +688,11 @@ def main() -> int:
                     )
                     print(f"ERROR {original_source}: {exc}", file=sys.stderr)
                     notify_error = None if args.dry_run else notify_safely(
-                        notify_config, "error", original_source, error=error_detail
+                        notify_config,
+                        "error",
+                        original_source,
+                        result=notification_result,
+                        error=error_detail,
                     )
                     if notify_error:
                         append_log(log_path, {"status": "notification_error", "sha256": digest, "error": notify_error})
