@@ -58,6 +58,47 @@ def pdf_upload_name(source: Path) -> str:
     return f"{stem}.pdf"
 
 
+def rename_source_pdf(source: Path, payload: dict, digest: str, dry_run: bool = False) -> dict:
+    """Rename the original PDF only when all three naming fields are readable."""
+    seiban = payload.get("seiban")
+    revision = payload.get("pdf_hansu")
+    customer = payload.get("demand_customer_name")
+    if (
+        not isinstance(seiban, str)
+        or not re.fullmatch(r"[A-Z0-9_-]{1,25}", seiban.strip().upper())
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or not 0 <= revision <= 999
+        or not isinstance(customer, str)
+        or not customer.strip()
+        or re.search(r"ERROR|エラー|読取不可|読み取れ|不明|記載なし", customer, re.IGNORECASE)
+    ):
+        return {"status": "not_renamed", "reason": "製番・版数・需要家名を読み取れません。"}
+    if source.suffix.lower() != ".pdf":
+        return {"status": "not_renamed", "reason": "元ファイルがPDFではありません。"}
+    customer = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", customer.strip())[:80].rstrip(" .")
+    if not customer:
+        return {"status": "not_renamed", "reason": "需要家名をファイル名に使用できません。"}
+    if not source.is_file() or file_hash(source) != digest:
+        return {"status": "not_renamed", "reason": "元PDFが移動または変更されています。"}
+    filename = f"{seiban.strip().upper()}_R{revision}_{customer}.PDF"
+    target = source.with_name(filename)
+    if source.name == filename:
+        return {"status": "already_named", "path": str(source)}
+    if source.resolve() != target.resolve():
+        counter = 1
+        while target.exists():
+            target = source.with_name(f"{Path(filename).stem}_{counter}.PDF")
+            counter += 1
+    if not dry_run:
+        source.rename(target)
+    return {
+        "status": "dry_run" if dry_run else "renamed",
+        "original_path": str(source),
+        "path": str(target),
+    }
+
+
 def xdw_print_name(source: Path, digest: str) -> str:
     """固定出力先で同名競合しない、空白なしの印刷用XDW名を作る。"""
     stem = re.sub(r"\s+", "", source.stem, flags=re.UNICODE) or "upload"
@@ -161,7 +202,7 @@ class ProcessingState:
             """
             SELECT sha256, source_path, queue_path, status, source_mtime
               FROM processed_files
-             WHERE status IN ('queued', 'processing', 'error')
+             WHERE status IN ('queued', 'processing', 'error', 'extracting')
                AND source_mtime IS NOT NULL
                AND source_mtime <= ?
              ORDER BY source_mtime, queued_at
@@ -189,7 +230,7 @@ class ProcessingState:
             "SELECT status, updated_at FROM processed_files WHERE sha256 = ?", (digest,)
         ).fetchone()
         # 前回プロセスが異常終了してprocessingのままなら、次回起動時に再開する。
-        if row is None or row[0] in {"queued", "processing"}:
+        if row is None or row[0] in {"queued", "processing", "extracting"}:
             return True
         if row[0] != "error" or not retry_errors:
             return False
@@ -322,6 +363,74 @@ def rtcm_config() -> RtcmConfig:
     )
 
 
+def prepare_upload_pdf(source: Path, digest: str, work_folder: Path) -> Path:
+    job_folder = work_folder / digest[:16]
+    job_folder.mkdir(parents=True, exist_ok=True)
+    upload_pdf = job_folder / pdf_upload_name(source)
+    if source.suffix.lower() == ".xdw":
+        print_xdw = job_folder / xdw_print_name(source, digest)
+        if not print_xdw.exists():
+            shutil.copy2(source, print_xdw)
+        return convert_xdw_to_pdf(print_xdw, upload_pdf)
+    if source.resolve() != upload_pdf.resolve():
+        shutil.copy2(source, upload_pdf)
+    return upload_pdf
+
+
+def prepare_queue_item(item: dict, state: ProcessingState, browser: GenuBrowser,
+                       work_folder: Path, dry_run: bool = False) -> dict:
+    """Extract and rename at intake; persist results before registration is scheduled."""
+    digest = item["sha256"]
+    original = Path(item["source_path"])
+    queued = Path(item["queue_path"])
+    if not queued.is_file():
+        renamed_copy = queued.with_name(original.name)
+        if renamed_copy.is_file() and file_hash(renamed_copy) == digest:
+            queued = renamed_copy
+    job_folder = work_folder / digest[:16]
+    job_folder.mkdir(parents=True, exist_ok=True)
+    cache = job_folder / "extracted.json"
+    intake_path = job_folder / "intake.json"
+    rename_info = {"status": "not_renamed", "reason": "命名情報を取得できません。"}
+
+    def metadata(payload):
+        nonlocal original
+        rename_info.update(rename_source_pdf(original, payload, digest, dry_run))
+        if rename_info["status"] in {"renamed", "already_named"}:
+            original = Path(rename_info["path"])
+        state.record(digest, original, "extracting")
+        intake_path.write_text(json.dumps({"source": str(original), "pdf_rename": rename_info}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    state.record(digest, original, "extracting")
+    try:
+        if cache.is_file():
+            extracted = validate_extracted(json.loads(cache.read_text(encoding="utf-8")))
+            metadata(extracted.__dict__)
+        else:
+            upload_pdf = prepare_upload_pdf(queued, digest, work_folder)
+            print(f"受付時の生成AI抽出: {original.name}", flush=True)
+            extracted = browser.extract(upload_pdf, on_metadata=metadata)
+            temporary_cache = cache.with_suffix(".json.tmp")
+            temporary_cache.write_text(json.dumps(extracted.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary_cache.replace(cache)
+        if not dry_run and original.suffix.lower() == ".pdf" and rename_info["status"] in {"renamed", "already_named"}:
+            target = queued.with_name(original.name)
+            if queued != target:
+                if target.exists():
+                    raise FileExistsError(f"キューのリネーム先が既に存在します: {target}")
+                queued.rename(target)
+                queued = target
+        state.connection.execute(
+            "UPDATE processed_files SET source_path = ?, queue_path = ? WHERE sha256 = ?",
+            (str(original), str(queued), digest),
+        )
+        state.record(digest, original, "queued", result={"pdf_rename": rename_info})
+        return {**item, "source_path": str(original), "queue_path": str(queued), "pdf_rename": rename_info}
+    except Exception:
+        state.record(digest, original, "error", error=traceback.format_exc())
+        raise
+
+
 def process_file(
     source: Path,
     digest: str,
@@ -333,24 +442,25 @@ def process_file(
     archive_pdf_enabled: bool,
     c1_browser: C1WarehouseBrowser,
     c1_enabled: bool,
+    on_metadata=None,
+    pdf_rename: dict | None = None,
 ) -> dict:
     job_folder = work_folder / digest[:16]
     job_folder.mkdir(parents=True, exist_ok=True)
-    upload_pdf = job_folder / pdf_upload_name(source)
-    if source.suffix.lower() == ".xdw":
-        print(f"処理中: XDWをPDFへ変換します: {source}", flush=True)
-        print_xdw = job_folder / xdw_print_name(source, digest)
-        if not print_xdw.exists():
-            shutil.copy2(source, print_xdw)
-        pdf_path = convert_xdw_to_pdf(print_xdw, upload_pdf)
+    pdf_path = prepare_upload_pdf(source, digest, work_folder)
+    extracted_cache = job_folder / "extracted.json"
+    if extracted_cache.is_file():
+        extracted = validate_extracted(json.loads(extracted_cache.read_text(encoding="utf-8")))
+        print(f"保存済み生成AI抽出結果を再利用: {extracted.seiban}", flush=True)
+        if on_metadata is not None:
+            on_metadata(extracted.__dict__)
     else:
-        # 元PDFは変更せず、空白を除いた名前の作業用コピーをアップロードする。
-        if source.resolve() != upload_pdf.resolve():
-            shutil.copy2(source, upload_pdf)
-        pdf_path = upload_pdf
-
-    print(f"処理中: 生成AIへアップロードします: {pdf_path.name}", flush=True)
-    extracted = browser.extract(pdf_path)
+        print(f"処理中: 生成AIへアップロードします: {pdf_path.name}", flush=True)
+        extracted = (
+            browser.extract(pdf_path, on_metadata=on_metadata)
+            if on_metadata is not None
+            else browser.extract(pdf_path)
+        )
     print(f"生成AI抽出完了: {json.dumps(extracted.__dict__, ensure_ascii=False)}", flush=True)
     (job_folder / "extracted.json").write_text(
         json.dumps(extracted.__dict__, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -401,6 +511,7 @@ def process_file(
                 "pdf": str(pdf_path),
                 "extracted": extracted.__dict__,
                 "database": db_result,
+                "pdf_rename": dict(pdf_rename or {}),
                 "c1_warehouse": {
                     "status": "error",
                     "registered": False,
@@ -425,11 +536,17 @@ def process_file(
         "extracted": extracted.__dict__,
         "database": db_result,
         "c1_warehouse": c1_result,
+        "pdf_rename": dict(pdf_rename or {}),
     }
     result["archive_pdf_enabled"] = archive_pdf_enabled
     if not dry_run and archive_pdf_enabled:
         try:
-            archived_pdf = archive_pdf(source, pdf_path, watch_folder, digest, datetime.now(JST))
+            archive_source = (
+                Path(pdf_rename["path"])
+                if pdf_rename and pdf_rename.get("status") in {"renamed", "already_named"}
+                else source
+            )
+            archived_pdf = archive_pdf(archive_source, pdf_path, watch_folder, digest, datetime.now(JST))
             result["archived_pdf"] = str(archived_pdf)
             result["pdf"] = str(archived_pdf)
         except Exception as exc:
@@ -608,8 +725,9 @@ def main() -> int:
                 if not queued_copy.exists():
                     shutil.copy2(discovered_source, queued_copy)
                 if state.enqueue(discovered_digest, discovered_source, queued_copy):
+                    state.record(discovered_digest, discovered_source, "extracting")
                     queued_event = {
-                        "status": "queued",
+                        "status": "extracting",
                         "sha256": discovered_digest,
                         "source": str(discovered_source),
                         "queue_path": str(queued_copy),
@@ -619,10 +737,38 @@ def main() -> int:
                     }
                     append_log(log_path, queued_event)
                     print(
-                        f"キュー登録: {discovered_source} -> {queued_copy}",
+                        f"抽出待ち受付: {discovered_source} -> {queued_copy}",
                         flush=True,
                     )
 
+            # Extraction is immediate for every received file, independent of the
+            # registration cutoff. A durable copy/state exists before the AI call.
+            failed_intakes = set()
+            for pending in state.ready_items(datetime.max.replace(tzinfo=JST)):
+                digest = pending["sha256"]
+                job_folder = work_folder / digest[:16]
+                if (job_folder / "intake.json").is_file() and (job_folder / "extracted.json").is_file() and pending["status"] != "extracting":
+                    continue
+                retry_errors = args.retry_errors or args.once or auto_retry_errors
+                retry_delay = 0 if (args.retry_errors or args.once) else error_retry_seconds
+                if not state.should_process(digest, retry_errors, retry_delay):
+                    failed_intakes.add(digest)
+                    continue
+                try:
+                    prepared = prepare_queue_item(pending, state, browser, work_folder, args.dry_run)
+                    append_log(log_path, {"status": "queued", **prepared})
+                    print(f"キュー登録: {prepared['source_path']} -> {prepared['queue_path']}", flush=True)
+                except Exception as exc:
+                    failed_intakes.add(digest)
+                    detail = traceback.format_exc()
+                    append_log(log_path, {"status": "error", "phase": "intake", "sha256": digest, "source": pending["source_path"], "error": detail})
+                    print(f"受付時抽出エラー: {exc}", file=sys.stderr)
+                    if not args.dry_run:
+                        notify_error = notify_safely(notify_config, "error", Path(pending["source_path"]), error=detail)
+                        if notify_error:
+                            append_log(log_path, {"status": "notification_error", "sha256": digest, "error": notify_error})
+
+            now = datetime.now(JST)
             # --once は従来どおり手動即時実行。常駐時は、直近の平日バッチ時刻
             # 以前に格納されたファイルだけを処理し、それ以降の追加分は次回へ回す。
             cutoff = now if args.once else latest_weekday_batch_cutoff(now, batch_time)
@@ -630,6 +776,8 @@ def main() -> int:
                 source = Path(queued_item["queue_path"])
                 original_source = Path(queued_item["source_path"])
                 digest = queued_item["sha256"]
+                if digest in failed_intakes:
+                    continue
                 # 明示指定と単発実行は即時、常駐監視は設定した待機時間後に再試行する。
                 retry_errors = args.retry_errors or args.once or auto_retry_errors
                 retry_after_seconds = 0 if (args.retry_errors or args.once) else error_retry_seconds
@@ -637,6 +785,22 @@ def main() -> int:
                     continue
                 state.record(digest, original_source, "processing")
                 print(f"処理開始: {original_source}", flush=True)
+                rename_result = {"status": "not_renamed", "reason": "生成AIから命名情報を取得できません。"}
+
+                def on_metadata(payload):
+                    nonlocal original_source
+                    try:
+                        outcome = rename_source_pdf(original_source, payload, digest, args.dry_run)
+                        rename_result.clear()
+                        rename_result.update(outcome)
+                        if rename_result["status"] in {"renamed", "already_named"}:
+                            original_source = Path(rename_result["path"])
+                            state.record(digest, original_source, "processing")
+                        print(f"PDFリネーム: {json.dumps(rename_result, ensure_ascii=False)}", flush=True)
+                    except OSError as exc:
+                        rename_result.clear()
+                        rename_result.update({"status": "error", "error": str(exc)})
+
                 try:
                     if not source.is_file():
                         raise FileNotFoundError(f"作業用キューファイルが見つかりません: {source}")
@@ -651,8 +815,11 @@ def main() -> int:
                         archive_pdf_enabled,
                         c1_browser,
                         c1_enabled,
+                        on_metadata=on_metadata,
+                        pdf_rename=rename_result,
                     )
                     result["source"] = str(original_source)
+                    result["pdf_rename"] = rename_result
                     result["queue_source"] = str(source)
                     process_status = (
                         "skipped" if result.get("database", {}).get("skipped") else "success"
@@ -683,6 +850,7 @@ def main() -> int:
                             "sha256": digest,
                             "source": str(original_source),
                             "queue_path": str(source),
+                            "pdf_rename": rename_result,
                             "error": error_detail,
                         },
                     )

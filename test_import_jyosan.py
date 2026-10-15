@@ -4,12 +4,13 @@ import os
 import sys
 import tempfile
 import types
+from unittest.mock import patch
 from datetime import datetime, time as datetime_time
 from decimal import Decimal
 from pathlib import Path
 
 from c1_browser import C1WarehouseBrowser
-from genu_browser import parse_json_from_result, save_windows_credential
+from genu_browser import parse_json_from_result, parse_result_payload, save_windows_credential
 from notifier import build_notification, load_notify_config
 from import_jyosan import (
     ExtractedData,
@@ -31,6 +32,10 @@ from watch_folder import (
     latest_weekday_batch_cutoff,
     parse_batch_time,
     pdf_upload_name,
+    file_hash,
+    process_file,
+    prepare_queue_item,
+    rename_source_pdf,
     process_c1_only,
     queue_copy_path,
     xdw_print_name,
@@ -184,6 +189,133 @@ class ImportJyosanTest(unittest.TestCase):
     def test_pdf_upload_name_removes_spaces(self):
         self.assertEqual(pdf_upload_name(Path("V3579 R1 DIC.pdf")), "V3579R1DIC.pdf")
         self.assertEqual(pdf_upload_name(Path("V3579　R1\tDIC.xdw")), "V3579R1DIC.pdf")
+
+    def test_pdf_rename_for_u_seiban_and_revision_11(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "original.pdf"
+            original.write_bytes(b"original pdf")
+            payload = {"seiban": "U1234", "pdf_hansu": 11, "demand_customer_name": "トヨタバッテリー"}
+            result = rename_source_pdf(original, payload, file_hash(original))
+            renamed = Path(result["path"])
+            self.assertEqual(renamed.name, "U1234_R11_トヨタバッテリー.PDF")
+            self.assertEqual(renamed.read_bytes(), b"original pdf")
+            self.assertFalse(original.exists())
+
+    def test_pdf_rename_missing_information_keeps_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "original.pdf"
+            original.write_bytes(b"pdf")
+            for payload in (
+                {"seiban": "V3680", "pdf_hansu": 0},
+                {"seiban": "V3680", "pdf_hansu": None, "demand_customer_name": "顧客"},
+                {"seiban": "V3680", "pdf_hansu": 0, "demand_customer_name": "ERROR: 不明"},
+            ):
+                self.assertEqual(rename_source_pdf(original, payload, file_hash(original))["status"], "not_renamed")
+                self.assertTrue(original.exists())
+
+    def test_pdf_rename_collision_preserves_both_files_and_dry_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "original.pdf"
+            original.write_bytes(b"new")
+            existing = Path(directory) / "V3680_R0_顧客.PDF"
+            existing.write_bytes(b"existing")
+            payload = {"seiban": "V3680", "pdf_hansu": 0, "demand_customer_name": "顧客"}
+            digest = file_hash(original)
+            self.assertEqual(rename_source_pdf(original, payload, digest, True)["status"], "dry_run")
+            self.assertTrue(original.exists())
+            result = rename_source_pdf(original, payload, digest)
+            self.assertEqual(Path(result["path"]).name, "V3680_R0_顧客_1.PDF")
+            self.assertEqual(existing.read_bytes(), b"existing")
+            self.assertEqual(Path(result["path"]).read_bytes(), b"new")
+
+    def test_rename_metadata_does_not_require_other_registration_fields(self):
+        payload = parse_result_payload('{"seiban":"U1234","pdf_hansu":11,"demand_customer_name":"顧客"}')
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "original.pdf"
+            original.write_bytes(b"pdf")
+            self.assertEqual(rename_source_pdf(original, payload, file_hash(original))["status"], "renamed")
+
+    def test_process_file_renames_before_rtcm_skip(self):
+        for seiban, revision in (("U1234", 0), ("V3680", 11)):
+            with self.subTest(seiban=seiban), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = root / "original.pdf"
+                original.write_bytes(b"pdf")
+                payload = {"seiban": seiban, "pdf_hansu": revision, "otkmkmnoki": "20261030", "otkmkmcost": 1, **self.customer}
+                extracted = validate_extracted(payload)
+                digest = file_hash(original)
+                rename_info = {}
+
+                def metadata(value):
+                    rename_info.update(rename_source_pdf(original, value, digest))
+
+                def extract(pdf_path, on_metadata):
+                    on_metadata(payload)
+                    return extracted
+
+                with patch("watch_folder.insert_into_oracle", return_value={"skipped": True}) as database:
+                    result = process_file(original, digest, types.SimpleNamespace(extract=extract), root / "work", self.config, False, root, False, None, False, on_metadata=metadata, pdf_rename=rename_info)
+                self.assertTrue(result["database"]["skipped"])
+                self.assertEqual(result["pdf_rename"]["status"], "renamed")
+                self.assertTrue(Path(rename_info["path"]).exists())
+                database.assert_called_once()
+
+    def test_intake_extracts_renames_and_batch_uses_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "original.pdf"
+            original.write_bytes(b"pdf")
+            work = root / "work"
+            digest = file_hash(original)
+            queued = queue_copy_path(work, original, digest)
+            queued.write_bytes(original.read_bytes())
+            state = ProcessingState(root / "state.sqlite3")
+            state.enqueue(digest, original, queued)
+            item = state.ready_items(datetime.max.replace(tzinfo=JST))[0]
+            calls = []
+
+            def extract(pdf_path, on_metadata):
+                calls.append(pdf_path)
+                on_metadata(self.extracted.__dict__)
+                return self.extracted
+
+            browser = types.SimpleNamespace(extract=extract)
+            prepared = prepare_queue_item(item, state, browser, work)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(Path(prepared["source_path"]).name, "V3579_R0_太陽誘電.PDF")
+            self.assertEqual(Path(prepared["queue_path"]).name, "V3579_R0_太陽誘電.PDF")
+            self.assertFalse(original.exists())
+            self.assertTrue(Path(prepared["queue_path"]).is_file())
+            self.assertEqual(state.ready_items(datetime.max.replace(tzinfo=JST))[0]["status"], "queued")
+            with patch("watch_folder.insert_into_oracle", return_value={"skipped": True}):
+                process_file(Path(prepared["queue_path"]), digest, browser, work, self.config, False, root, False, None, False)
+            self.assertEqual(len(calls), 1)
+            state.connection.close()
+
+    def test_intake_failure_keeps_durable_copy_and_can_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "original.pdf"
+            original.write_bytes(b"pdf")
+            work = root / "work"
+            digest = file_hash(original)
+            queued = queue_copy_path(work, original, digest)
+            queued.write_bytes(b"pdf")
+            state = ProcessingState(root / "state.sqlite3")
+            state.enqueue(digest, original, queued)
+            item = state.ready_items(datetime.max.replace(tzinfo=JST))[0]
+
+            def failed_extract(pdf_path, on_metadata):
+                raise TimeoutError("AI unavailable")
+
+            with self.assertRaises(TimeoutError):
+                prepare_queue_item(item, state, types.SimpleNamespace(extract=failed_extract), work)
+            self.assertTrue(original.exists())
+            self.assertTrue(queued.exists())
+            self.assertEqual(state.ready_items(datetime.max.replace(tzinfo=JST))[0]["status"], "error")
+            self.assertFalse(state.should_process(digest, False))
+            self.assertTrue(state.should_process(digest, True))
+            state.connection.close()
 
     def test_xdw_print_name_is_unique_and_has_no_spaces(self):
         name = xdw_print_name(Path("U9007884 R0 瓢屋.xdw"), "abcdef1234567890")

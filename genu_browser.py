@@ -72,16 +72,23 @@ def save_windows_credential(target: str, username: str, password: str) -> None:
     )
 
 
-def parse_json_from_result(text: str) -> ExtractedData:
+def parse_result_payload(text: str) -> dict[str, Any]:
     raw = strip_json_fence(text)
     try:
-        return validate_extracted(json.loads(raw))
+        value = json.loads(raw)
     except json.JSONDecodeError:
         # 画面側が前後に説明を付けた場合でも、最初のJSONオブジェクトだけを候補にする。
         match = re.search(r"\{[\s\S]*?\}", raw)
         if not match:
             raise ValueError(f"生成AIの画面結果からJSONを取得できません: {raw[:500]}")
-        return validate_extracted(json.loads(match.group(0)))
+        value = json.loads(match.group(0))
+    if not isinstance(value, dict):
+        raise ValueError("生成AIの結果はJSONオブジェクトである必要があります")
+    return value
+
+
+def parse_json_from_result(text: str) -> ExtractedData:
+    return validate_extracted(parse_result_payload(text))
 
 
 class GenuBrowser:
@@ -161,7 +168,7 @@ class GenuBrowser:
             save_windows_credential(self.target, entered_username, entered_password)
             print(f"汎用資格情報 {self.target!r} に保存しました。")
 
-    def extract(self, pdf_path: Path) -> ExtractedData:
+    def extract(self, pdf_path: Path, on_metadata=None) -> ExtractedData:
         if not self._upload_input_visible():
             self.ensure_logged_in()
 
@@ -233,10 +240,19 @@ class GenuBrowser:
         result_timeout = int(os.getenv("GENAI_RESULT_TIMEOUT_SECONDS", "300"))
         deadline = time.monotonic() + result_timeout
         last_result = ""
+        metadata_delivered = False
         while time.monotonic() < deadline:
             current = result_box.inner_text().strip() if result_box.count() else ""
             if current:
                 last_result = current
+                try:
+                    payload = parse_result_payload(current)
+                except (ValueError, TypeError):
+                    payload = None
+                if payload is not None and on_metadata is not None and not metadata_delivered:
+                    # Rename needs only three fields, independently of RTCM/C1 validation.
+                    on_metadata(payload)
+                    metadata_delivered = True
                 try:
                     # 回答はストリーミング表示されるため、説明文や途中までのJSONを
                     # 最終結果とみなさず、全項目が揃った妥当なJSONになるまで待つ。
